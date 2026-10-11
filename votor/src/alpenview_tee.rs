@@ -1,0 +1,123 @@
+//! Optional tee of raw consensus-metrics events to a local UDP socket, for
+//! external per-slot analysis (Alpenview). Enabled by setting
+//! `ALPENVIEW_TEE_UDP=host:port`; otherwise inert.
+//!
+//! Runs on the metrics thread, never blocks: the socket is non-blocking and a
+//! failed send is counted and dropped. Each datagram is one JSON line:
+//! `{"t":<unix ns when the batch was received>,"e":[<events>]}` where an event is
+//! `["v",kind,slot,block_id,vote_pubkey]`, `["b",slot,leader]` (block hash
+//! seen), `["s",slot]` (start of slot) or `["f",slot]` (slot finalized).
+
+use {
+    agave_votor_messages::{metric_types::ConsensusMetricsEvent, vote::Vote},
+    std::{
+        fmt::Write as _,
+        net::UdpSocket,
+        time::{Instant, SystemTime, UNIX_EPOCH},
+    },
+};
+
+const ENV_VAR: &str = "ALPENVIEW_TEE_UDP";
+/// Keep datagrams comfortably under the 64 KiB UDP limit.
+const MAX_DATAGRAM_BYTES: usize = 60_000;
+const DROP_LOG_INTERVAL: u64 = 10_000;
+
+pub struct AlpenviewTee {
+    socket: UdpSocket,
+    target: String,
+    dropped: u64,
+}
+
+impl AlpenviewTee {
+    /// Returns `None` unless `ALPENVIEW_TEE_UDP` is set and the socket can be created.
+    pub fn from_env() -> Option<Self> {
+        let target = std::env::var(ENV_VAR).ok()?;
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => socket,
+            Err(err) => {
+                warn!("alpenview tee: cannot bind UDP socket: {err}");
+                return None;
+            }
+        };
+        if let Err(err) = socket.set_nonblocking(true) {
+            warn!("alpenview tee: cannot set non-blocking: {err}");
+            return None;
+        }
+        info!("alpenview tee: streaming consensus events to {target}");
+        Some(Self {
+            socket,
+            target,
+            dropped: 0,
+        })
+    }
+
+    pub fn emit(&mut self, received: Instant, events: &[ConsensusMetricsEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        let observed_ns = wall_clock_nanos(received);
+        let header = format!("{{\"t\":{observed_ns},\"e\":[");
+        let mut line = header.clone();
+        let mut first = true;
+        for event in events {
+            let mut item = String::with_capacity(160);
+            write_event(&mut item, event);
+            if line.len() + item.len() + 3 > MAX_DATAGRAM_BYTES && !first {
+                line.push_str("]}");
+                self.send(&line);
+                line = header.clone();
+                first = true;
+            }
+            if !first {
+                line.push(',');
+            }
+            line.push_str(&item);
+            first = false;
+        }
+        line.push_str("]}");
+        self.send(&line);
+    }
+
+    fn send(&mut self, line: &str) {
+        if self.socket.send_to(line.as_bytes(), &self.target).is_err() {
+            self.dropped += 1;
+            if self.dropped % DROP_LOG_INTERVAL == 1 {
+                warn!("alpenview tee: {} datagrams dropped so far", self.dropped);
+            }
+        }
+    }
+}
+
+fn wall_clock_nanos(received: Instant) -> u128 {
+    let elapsed = Instant::now().saturating_duration_since(received);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|now| now.saturating_sub(elapsed).as_nanos())
+        .unwrap_or(0)
+}
+
+fn write_event(out: &mut String, event: &ConsensusMetricsEvent) {
+    match event {
+        ConsensusMetricsEvent::Vote { id, vote } => {
+            let (kind, block_id) = match vote {
+                Vote::Notarize(v) => ("notar", Some(v.block.block_id)),
+                Vote::NotarizeFallback(v) => ("notar_fb", Some(v.block.block_id)),
+                Vote::Finalize(_) => ("final", None),
+                Vote::Skip(_) => ("skip", None),
+                Vote::SkipFallback(_) => ("skip_fb", None),
+                Vote::Genesis(v) => ("genesis", Some(v.block.block_id)),
+            };
+            let block_id = block_id.map(|h| h.to_string()).unwrap_or_default();
+            let _ = write!(out, "[\"v\",\"{kind}\",{},\"{block_id}\",\"{id}\"]", vote.slot());
+        }
+        ConsensusMetricsEvent::BlockHashSeen { leader, slot } => {
+            let _ = write!(out, "[\"b\",{slot},\"{leader}\"]");
+        }
+        ConsensusMetricsEvent::StartOfSlot { slot } => {
+            let _ = write!(out, "[\"s\",{slot}]");
+        }
+        ConsensusMetricsEvent::SlotFinalized { slot } => {
+            let _ = write!(out, "[\"f\",{slot}]");
+        }
+    }
+}

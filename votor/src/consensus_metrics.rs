@@ -93,6 +93,9 @@ pub struct ConsensusMetrics {
 
     /// Receiver for events.
     receiver: ConsensusMetricsEventReceiver,
+
+    /// Optional raw-event tee (see `alpenview_tee`).
+    tee: Option<crate::alpenview_tee::AlpenviewTee>,
 }
 
 impl ConsensusMetrics {
@@ -103,6 +106,7 @@ impl ConsensusMetrics {
             highest_finalized_slot: None,
             epoch_schedule,
             receiver,
+            tee: crate::alpenview_tee::AlpenviewTee::from_env(),
         }
     }
 
@@ -124,6 +128,9 @@ impl ConsensusMetrics {
         while !exit.load(Ordering::Relaxed) {
             match self.receiver.recv_timeout(Duration::from_secs(1)) {
                 Ok((received, events)) => {
+                    if let Some(tee) = self.tee.as_mut() {
+                        tee.emit(received, &events);
+                    }
                     for event in events {
                         match event {
                             ConsensusMetricsEvent::Vote { id, vote } => {
