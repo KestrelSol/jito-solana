@@ -8,6 +8,7 @@ pub mod aggregate_accumulator;
 pub mod commitment;
 pub mod common;
 pub mod consensus_metrics;
+pub mod alpenview_tee;
 pub mod consensus_pool;
 mod consensus_pool_service;
 pub mod event;

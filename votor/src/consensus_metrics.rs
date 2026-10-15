@@ -93,6 +93,7 @@ pub struct ConsensusMetrics {
 
     /// Receiver for events.
     receiver: ConsensusMetricsEventReceiver,
+    tee: Option<crate::alpenview_tee::AlpenviewTee>,
 }
 
 impl ConsensusMetrics {
@@ -103,6 +104,7 @@ impl ConsensusMetrics {
             highest_finalized_slot: None,
             sharable_banks,
             receiver,
+            tee: crate::alpenview_tee::AlpenviewTee::from_env(),
         }
     }
 
@@ -123,7 +125,11 @@ impl ConsensusMetrics {
     fn run(&mut self, exit: Arc<AtomicBool>) {
         while !exit.load(Ordering::Relaxed) {
             match self.receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok((received, event)) => match event {
+                Ok((received, event)) => {
+                    if let Some(tee) = self.tee.as_mut() {
+                        tee.emit(received, std::slice::from_ref(&event));
+                    }
+                    match event {
                     ConsensusMetricsEvent::Vote { ids, vote } => {
                         self.record_vote(ids, &vote, received);
                     }
@@ -135,6 +141,7 @@ impl ConsensusMetrics {
                     }
                     ConsensusMetricsEvent::SlotFinalized { slot } => {
                         self.handle_slot_finalized(slot);
+                    }
                     }
                 },
                 Err(err) => match err {
